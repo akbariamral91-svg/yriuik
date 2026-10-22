@@ -1,0 +1,119 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_aab:
+        description: "Also build an AAB (Google Play)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FLET_CLI_NO_RICH_OUTPUT: "1"   # plain log output (avoids Rich/unicode problems in CI)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Syntax check
+        run: python -m compileall -q .
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  android:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write          # needed to attach the APK to a GitHub Release
+    env:
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Flet (CLI + runtime, pinned)
+        run: python -m pip install --upgrade pip && pip install "flet[all]==0.28.3"
+      - name: Show tool versions
+        run: |
+          flet --version
+          python --version
+          java -version
+      - name: Detect optional CLI flags supported by this Flet version
+        run: |
+          HELP="$(flet build --help 2>&1 || true)"
+          EXTRA=""
+          case "$HELP" in *--yes*) EXTRA="$EXTRA --yes";; esac
+          case "$HELP" in *--no-rich-output*) EXTRA="$EXTRA --no-rich-output";; esac
+          echo "EXTRA_ARGS=$EXTRA" >> "$GITHUB_ENV"
+          echo "Extra flags:${EXTRA:- none}"
+      - name: Download Vazirmatn font
+        run: python tools/get_font.py
+      - name: Check Flet API names (informational)
+        run: python tools/check_flet_api.py || echo "::warning::API check could not run"
+      - name: Read version from meta.py
+        run: |
+          echo "APP_VERSION=$(python -c 'import meta; print(meta.VERSION)')" >> "$GITHUB_ENV"
+          echo "APP_BUILD=$(python -c 'import meta; print(meta.BUILD_NUMBER)')" >> "$GITHUB_ENV"
+      - name: Prepare signing (only if all signing secrets exist)
+        if: env.ANDROID_KEYSTORE_B64 != '' && env.ANDROID_KEY_ALIAS != '' && env.ANDROID_KEYSTORE_PASSWORD != '' && env.ANDROID_KEY_PASSWORD != ''
+        run: |
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "SIGN_ARGS=--android-signing-key-store $RUNNER_TEMP/release.jks --android-signing-key-alias $ANDROID_KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "FLET_ANDROID_SIGNING_KEY_PASSWORD=$ANDROID_KEY_PASSWORD" >> "$GITHUB_ENV"
+      - name: Build APK (universal, installs on any phone)
+        run: flet build apk $EXTRA_ARGS --build-version "$APP_VERSION" --build-number "$APP_BUILD" $SIGN_ARGS
+      - name: Build AAB (Google Play, manual only)
+        if: github.event_name == 'workflow_dispatch' && inputs.build_aab
+        run: flet build aab $EXTRA_ARGS --build-version "$APP_VERSION" --build-number "$APP_BUILD" $SIGN_ARGS
+      - name: Collect outputs
+        run: |
+          mkdir -p dist
+          shopt -s nullglob
+          apks=(build/apk/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then apks=(build/flutter/build/app/outputs/flutter-apk/*-release.apk); fi
+          if [ ${#apks[@]} -eq 0 ]; then echo "::error::No APK was produced"; find build -maxdepth 4 -name '*.apk' -o -maxdepth 4 -name '*.aab' || true; exit 1; fi
+          for f in "${apks[@]}"; do
+            suffix="$(basename "$f" .apk | sed -e 's/^app-//' -e 's/-\?release$//')"
+            cp "$f" "dist/GetBetter-${APP_VERSION}${suffix:+-$suffix}.apk"
+          done
+          for f in build/aab/*.aab; do cp "$f" "dist/GetBetter-${APP_VERSION}.aab"; done
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: get-better-${{ env.APP_VERSION }}-android
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish GitHub Release (direct APK download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
+          name: Get Better ${{ env.APP_VERSION }} (build ${{ github.run_number }})
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -1,0 +1,20 @@
+[project]
+name = "getbetter"
+version = "3.4.2"
+description = "Get Better — برنامه‌ریز آمادگی آزمون (آفلاین، جلالی)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["flet==0.28.3"]
+
+[tool.flet]
+product = "Get Better"
+org = "com.getbetter"
+company = "Get Better"
+copyright = "Copyright (C) 2026 Get Better"
+
+[tool.flet.splash]
+color = "#F4F6FD"
+dark_color = "#060A18"
+
+[tool.flet.android]
+split_per_abi = false
